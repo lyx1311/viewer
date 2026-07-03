@@ -1,0 +1,39 @@
+[sync]
+source = "D:/SUSTech"
+remote_root = "Public/SUSTech"
+site_url = "https://viewer.lyx1311.top"
+dav_path = "/dav"
+credential_file = ".sync-private/webdav.dpapi"
+state_file = ".sync-state/state.json"
+cache_dir = ".sync-cache-user"
+report_file = ".sync-state/last-report.json"
+log_file = ".sync-state/sync.log"
+marker_name = ".viewer-sync-root"
+marker_value = "viewer-sustech-sync-v1"
+old_roots = ["E:/SUSTech"]
+image_extensions = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"]
+
+[schedule]
+task_name = "Viewer SUSTech Sync"
+interval_minutes = 30
+login_delay_minutes = 2
+
+[exclude]
+patterns = [
+  ".git/**",
+  "**/.git/**",
+  ".obsidian/**",
+  "**/.obsidian/**",
+  ".pytest_cache/**",
+  "**/.pytest_cache/**",
+  "node_modules/**",
+  "**/node_modules/**",
+  "__pycache__/**",
+  "**/__pycache__/**",
+  "**/.DS_Store",
+  "**/desktop.ini",
+  "**/Thumbs.db",
+  "**/~$*",
+  "**/*.tmp",
+  "**/*.bak",
+]

@@ -1,0 +1,11 @@
+.sync-private/
+.sync-state/
+.sync-cache/
+.sync-cache-user/
+viewer-build-*/
+__pycache__/
+.agents/
+.codex/
+*.pyc
+headers.txt
+public-home.html

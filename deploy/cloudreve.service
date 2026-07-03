@@ -1,0 +1,35 @@
+[Unit]
+Description=Cloudreve file viewer
+Documentation=https://docs.cloudreve.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudreve
+Group=cloudreve
+WorkingDirectory=/opt/cloudreve
+ExecStart=/opt/cloudreve/cloudreve -c /opt/cloudreve/data/conf.ini
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+KillMode=mixed
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/opt/cloudreve/data /srv/cloudreve-files
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
