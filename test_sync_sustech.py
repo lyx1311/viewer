@@ -31,6 +31,27 @@ class TransformTests(unittest.TestCase):
         self.assertIn('src="%E5%9B%BE%201%23x.png"', out)
         self.assertEqual(len(images), 1)
 
+    def test_mdx_void_elements_are_self_closing(self):
+        out, _ = self.pub.transform_markdown(
+            self.md,
+            '<img src="https://example.com/a.png"><br><br />',
+        )
+        self.assertEqual(
+            out,
+            '<img src="https://example.com/a.png" /><br /><br />',
+        )
+
+    def test_blank_quote_lines_become_hard_breaks(self):
+        source = (
+            "> question\n"
+            "> \n"
+            "> (A) first\n"
+            ">\n"
+            "> (B) second\n"
+        )
+        out, _ = self.pub.transform_markdown(self.md, source)
+        self.assertEqual(out, "> question  \n> (A) first  \n> (B) second\n")
+
     def test_obsidian(self):
         out, images = self.pub.transform_markdown(self.md, "![[图 1#x.png|说明]]")
         self.assertEqual(out, "![说明](%E5%9B%BE%201%23x.png)")

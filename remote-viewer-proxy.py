@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import http.client
 import json
+import mimetypes
 import os
 import shutil
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 UPSTREAM_HOST = "127.0.0.1"
 UPSTREAM_PORT = 18082
@@ -13,6 +14,8 @@ LISTEN_PORTS = (18080, 18081)
 REDIRECT_TARGET = "/s/xguO"
 ADMIN_TARGET = "/session?viewer_admin=1"
 LOGO_PATH = "/opt/viewer-proxy/viewer-logo.png"
+ASSET_PREFIX = "/viewer-assets/"
+ASSET_ROOT = "/opt/viewer-proxy/assets"
 ICON_PATHS = {
     "/favicon.ico",
     "/static/img/favicon.ico",
@@ -34,6 +37,25 @@ self.addEventListener("activate", function (event) {
     } catch (_) {}
   })());
 });
+"""
+KATEX_HEAD_ASSETS = b"""<link rel="stylesheet" href="/viewer-assets/katex/katex.min.css" data-viewer-katex="1">
+<script data-viewer-katex="1">
+window.__viewerKatexModuleGlobals = { define: window.define, module: window.module, exports: window.exports };
+try { window.define = undefined; } catch (_) {}
+try { window.module = undefined; } catch (_) {}
+try { window.exports = undefined; } catch (_) {}
+</script>
+<script src="/viewer-assets/katex/katex.min.js" data-viewer-katex="1"></script>
+<script src="/viewer-assets/katex/contrib/auto-render.min.js" data-viewer-katex="1"></script>
+<script data-viewer-katex="1">
+(function () {
+  var old = window.__viewerKatexModuleGlobals || {};
+  try { window.define = old.define; } catch (_) {}
+  try { window.module = old.module; } catch (_) {}
+  try { window.exports = old.exports; } catch (_) {}
+  try { delete window.__viewerKatexModuleGlobals; } catch (_) {}
+})();
+</script>
 """
 VIEWER_PATCH = """<script>
 (function () {
@@ -107,6 +129,517 @@ VIEWER_PATCH = """<script>
       }).catch(function () {});
     }
   } catch (_) {}
+
+  var markdownEnhancerPromise = null;
+  var markdownEnhanceScheduled = false;
+  var allowedHtmlTags = {
+    img: true,
+    br: true,
+    span: true,
+    sub: true,
+    sup: true,
+    kbd: true,
+    mark: true,
+    small: true,
+    details: true,
+    summary: true,
+    u: true,
+    s: true,
+    del: true,
+    ins: true,
+    center: true
+  };
+  var voidHtmlTags = { img: true, br: true };
+  var htmlTagPattern = /<\\/?(?:img|br|span|sub|sup|kbd|mark|small|details|summary|u|s|del|ins|center)\\b[^>]*>/i;
+  var htmlAttributes = {
+    img: { src: true, alt: true, title: true, width: true, height: true, loading: true, class: true },
+    span: { class: true, title: true },
+    sub: { class: true, title: true },
+    sup: { class: true, title: true },
+    kbd: { class: true, title: true },
+    mark: { class: true, title: true },
+    small: { class: true, title: true },
+    details: { class: true, title: true, open: true },
+    summary: { class: true, title: true },
+    u: { class: true, title: true },
+    s: { class: true, title: true },
+    del: { class: true, title: true },
+    ins: { class: true, title: true },
+    center: { class: true, title: true },
+    br: { class: true, title: true }
+  };
+
+  function ensureMarkdownEnhancerAssets() {
+    if (markdownEnhancerPromise) return markdownEnhancerPromise;
+    markdownEnhancerPromise = Promise.resolve().then(function () {
+      if (!window.katex) runEmbeddedUmd("viewer-katex-js");
+      if (!window.renderMathInElement) runEmbeddedUmd("viewer-katex-auto-render-js");
+      document.documentElement.setAttribute("data-viewer-katex-loaded", window.katex && window.renderMathInElement ? "1" : "0");
+    }).catch(function (error) {
+      try {
+        document.documentElement.setAttribute("data-viewer-katex-loaded", "error");
+        document.documentElement.setAttribute("data-viewer-katex-error", String(error && error.message || error || "unknown"));
+      } catch (_) {}
+    });
+    return markdownEnhancerPromise;
+  }
+
+  function runEmbeddedUmd(id) {
+    var node = document.getElementById(id);
+    if (!node) throw new Error("missing embedded script: " + id);
+    var source = node.textContent || "";
+    (0, eval)("(function(){var define=undefined,module=undefined,exports=undefined;\\n" + source + "\\n})();\\n//# sourceURL=" + id);
+  }
+
+  function isSafeImgSrc(value) {
+    var raw = String(value || "").trim();
+    if (!raw) return false;
+    var lower = raw.toLowerCase();
+    if (/^[a-z0-9+.-]+:/i.test(raw)) {
+      if (lower.indexOf("data:image/") === 0) return true;
+      try {
+        var parsed = new URL(raw, window.location.href);
+        return parsed.protocol === "http:" || parsed.protocol === "https:";
+      } catch (_) {
+        return false;
+      }
+    }
+    if (lower.indexOf("//") === 0) return true;
+    if (lower.indexOf("javascript:") === 0 || lower.indexOf("vbscript:") === 0 || lower.indexOf("data:") === 0) return false;
+    return true;
+  }
+
+  function textFallbackForElement(element) {
+    return document.createTextNode(element.outerHTML || element.textContent || "");
+  }
+
+  function sanitizeHtmlNode(node) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      var tag = node.tagName.toLowerCase();
+      if (!allowedHtmlTags[tag]) {
+        node.parentNode.replaceChild(textFallbackForElement(node), node);
+        return true;
+      }
+      Array.prototype.slice.call(node.attributes).forEach(function (attr) {
+        var name = attr.name.toLowerCase();
+        var allowed = htmlAttributes[tag] && htmlAttributes[tag][name];
+        if (!allowed || name.indexOf("on") === 0) {
+          node.removeAttribute(attr.name);
+          return;
+        }
+        if (tag === "img" && name === "src" && !isSafeImgSrc(attr.value)) {
+          node.removeAttribute(attr.name);
+        }
+      });
+      if (tag === "img") {
+        if (!node.getAttribute("loading")) node.setAttribute("loading", "lazy");
+        node.setAttribute("referrerpolicy", "no-referrer");
+      }
+      Array.prototype.slice.call(node.childNodes).forEach(sanitizeHtmlNode);
+      return true;
+    }
+    if (node.nodeType === Node.COMMENT_NODE) {
+      node.parentNode.removeChild(node);
+      return true;
+    }
+    return false;
+  }
+
+  function safeHtmlFragmentFromText(text) {
+    if (!htmlTagPattern.test(text)) return null;
+    var template = document.createElement("template");
+    template.innerHTML = text;
+    var hasAllowedElement = false;
+    Array.prototype.slice.call(template.content.childNodes).forEach(function (node) {
+      sanitizeHtmlNode(node);
+    });
+    Object.keys(allowedHtmlTags).forEach(function (tag) {
+      if (!hasAllowedElement && template.content.querySelector && template.content.querySelector(tag)) {
+        hasAllowedElement = true;
+      }
+    });
+    return hasAllowedElement ? template.content : null;
+  }
+
+  function decodeSafeHtmlText(root) {
+    if (!root) return;
+    var walker = document.createTreeWalker(root, 4, {
+      acceptNode: function (node) {
+        if (!node.nodeValue || !htmlTagPattern.test(node.nodeValue)) return 2;
+        var parent = node.parentElement;
+        if (!parent) return 2;
+        if (parent.closest("script,style,textarea,pre,code")) return 2;
+        return 1;
+      }
+    });
+    var nodes = [];
+    var current;
+    while ((current = walker.nextNode())) nodes.push(current);
+    nodes.forEach(function (node) {
+      var fragment = safeHtmlFragmentFromText(node.nodeValue);
+      if (fragment && node.parentNode) node.parentNode.replaceChild(fragment, node);
+    });
+  }
+
+  function normalizeTexForMarkdown(tex) {
+    var value = String(tex || "");
+    // Lexical/CommonMark consumes one slash from a TeX row separator at the
+    // physical end of a Markdown line. Restore it before KaTeX sees it.
+    var hadBrokenRows = /(^|[^\\\\])\\\\(?=[ \\t]*(?:\\r?\\n|$))/m.test(value);
+    if (hadBrokenRows) {
+      value = value.replace(/(^|[^\\\\])\\\\(?=[ \\t]*(?:\\r?\\n|$))/gm, "$1\\\\\\\\");
+    }
+    var hasRows = /\\\\\\\\[ \\t]*(?:\\r?\\n|$)/m.test(value);
+    var hasRowEnvironment = /\\\\begin\\{(?:aligned|alignedat|array|cases|gathered|matrix|bmatrix|Bmatrix|pmatrix|vmatrix|Vmatrix|smallmatrix|split)\\}/.test(value);
+    // A bare multi-line display block is valid in many note-taking apps but
+    // not in KaTeX. Give it an aligned environment without changing the file.
+    if (hasRows && !hasRowEnvironment) {
+      value = "\\\\begin{aligned}\\n" + value + "\\n\\\\end{aligned}";
+    }
+    return value;
+  }
+
+  function repairRenderedKatex(root) {
+    if (!root || !window.katex || !window.katex.renderToString) return;
+    root.querySelectorAll(".katex annotation[encoding='application/x-tex']").forEach(function (annotation) {
+      var tex = annotation.textContent || "";
+      var repaired = normalizeTexForMarkdown(tex);
+      if (repaired === tex) return;
+      var rendered = annotation.closest(".katex");
+      if (!rendered || rendered.getAttribute("data-viewer-row-repaired") === "1") return;
+      try {
+        var template = document.createElement("template");
+        var display = !!rendered.closest(".katex-display");
+        template.innerHTML = window.katex.renderToString(repaired, {
+          displayMode: display,
+          throwOnError: false,
+          strict: "ignore",
+          trust: false
+        });
+        var replacement = template.content.firstElementChild;
+        if (replacement) {
+          replacement.setAttribute("data-viewer-row-repaired", "1");
+          rendered.replaceWith(replacement);
+        }
+      } catch (_) {}
+    });
+  }
+
+  function renderTexText(root) {
+    if (!root || !window.katex || !window.katex.renderToString) return;
+    var walker = document.createTreeWalker(root, 4, {
+      acceptNode: function (node) {
+        var text = node.nodeValue || "";
+        if (text.indexOf("$") === -1 && text.indexOf("\\\\(") === -1 && text.indexOf("\\\\[") === -1) return 2;
+        var parent = node.parentElement;
+        if (!parent) return 2;
+        if (parent.closest("script,style,textarea,pre,code,.katex,[data-lexical-editor='true']")) return 2;
+        return 1;
+      }
+    });
+    var nodes = [];
+    var current;
+    while ((current = walker.nextNode())) nodes.push(current);
+    var pattern = /(\\$\\$[\\s\\S]+?\\$\\$|\\\\\\[[\\s\\S]+?\\\\\\]|\\\\\\([\\s\\S]+?\\\\\\)|\\$[^\\n$]+?\\$)/g;
+    nodes.forEach(function (node) {
+      var text = node.nodeValue || "";
+      if (!pattern.test(text)) return;
+      pattern.lastIndex = 0;
+      var fragment = document.createDocumentFragment();
+      var last = 0;
+      var changed = false;
+      var match;
+      while ((match = pattern.exec(text))) {
+        var token = match[0];
+        var display = false;
+        var tex = "";
+        if (token.indexOf("$$") === 0) {
+          display = true;
+          tex = token.slice(2, -2);
+        } else if (token.indexOf("\\\\[") === 0) {
+          display = true;
+          tex = token.slice(2, -2);
+        } else if (token.indexOf("\\\\(") === 0) {
+          tex = token.slice(2, -2);
+        } else {
+          tex = token.slice(1, -1);
+        }
+        if (!tex.trim()) continue;
+        if (match.index > last) fragment.appendChild(document.createTextNode(text.slice(last, match.index)));
+        try {
+          var template = document.createElement("template");
+          template.innerHTML = window.katex.renderToString(normalizeTexForMarkdown(tex), { displayMode: display, throwOnError: false });
+          fragment.appendChild(template.content);
+          changed = true;
+        } catch (_) {
+          fragment.appendChild(document.createTextNode(token));
+        }
+        last = match.index + token.length;
+      }
+      if (!changed) return;
+      if (last < text.length) fragment.appendChild(document.createTextNode(text.slice(last)));
+      if (node.parentNode) node.parentNode.replaceChild(fragment, node);
+    });
+  }
+
+  function texTextFromDisplayBlock(block) {
+    // Within a display formula, Cloudreve can turn _{...} into an <em> node.
+    // Rebuild that exact Markdown emphasis boundary as TeX subscript markers.
+    function visit(node) {
+      if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || "";
+      if (node.nodeType !== Node.ELEMENT_NODE) return "";
+      if (node.tagName === "BR") return "\\n";
+      var content = Array.prototype.map.call(node.childNodes, visit).join("");
+      return node.tagName === "EM" ? "_" + content + "_" : content;
+    }
+    return visit(block);
+  }
+
+  function renderKatexDisplayBlock(block, tex) {
+    try {
+      block.innerHTML = window.katex.renderToString(normalizeTexForMarkdown(tex), {
+        displayMode: true,
+        throwOnError: false,
+        strict: "ignore",
+        trust: false
+      });
+      block.setAttribute("data-viewer-display-math", "1");
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function renderLexicalDisplayBlocks(root) {
+    if (!root || !root.children || !window.katex) return;
+    var blocks = Array.prototype.slice.call(root.children);
+    for (var i = 0; i < blocks.length; i += 1) {
+      var first = blocks[i];
+      if (!first || first.getAttribute("data-viewer-display-math") === "1") continue;
+      var firstText = texTextFromDisplayBlock(first);
+      // Cloudreve's Markdown importer can split a display formula into two
+      // paragraphs: an opening delimiter plus formula, followed by a closing
+      // "$$" paragraph. Only join a deliberately standalone formula run; in
+      // particular, never search across a heading/list/plain-text block.
+      if (first.tagName !== "P") continue;
+      var trimmedFirst = firstText.replace(/^\\s+/, "");
+      var open = trimmedFirst.indexOf("$$");
+      var left = "$$";
+      var right = "$$";
+      if (open < 0) {
+        open = trimmedFirst.indexOf("\\\\[");
+        left = "\\\\[";
+        right = "\\\\]";
+      }
+      if (open !== 0) continue;
+      var afterOpen = trimmedFirst.slice(left.length);
+      var sameClose = afterOpen.indexOf(right);
+      if (sameClose >= 0) {
+        // Same-paragraph delimiters can still be split across inline spans by
+        // the rich-text parser, so render them here instead of relying on a
+        // text-node-only pass later.
+        if (afterOpen.slice(sameClose + right.length).trim()) continue;
+        var singleTex = afterOpen.slice(0, sameClose).trim();
+        if (singleTex) renderKatexDisplayBlock(first, singleTex);
+        continue;
+      }
+
+      var texParts = [afterOpen];
+      var end = -1;
+      for (var j = i + 1; j < blocks.length; j += 1) {
+        var candidate = blocks[j];
+        // A display block may span only adjacent paragraphs. This boundary is
+        // what makes malformed/unclosed delimiters harmless to nearby content.
+        if (!candidate || candidate.tagName !== "P") break;
+        var part = texTextFromDisplayBlock(candidate);
+        var trimmedPart = part.trim();
+        if (trimmedPart === right) {
+          end = j;
+          break;
+        }
+        // A second opening delimiter means this was not one formula run.
+        if (trimmedPart.indexOf(left) === 0 || trimmedPart.indexOf(right) >= 0) break;
+        texParts.push(part);
+      }
+      if (end < 0) continue;
+      var tex = texParts.join("\\n").trim();
+      if (!tex) continue;
+      if (renderKatexDisplayBlock(first, tex)) {
+        for (var k = i + 1; k <= end; k += 1) blocks[k].style.display = "none";
+        i = end;
+      }
+    }
+  }
+
+  function enhanceLexicalPreviews() {
+    if (!window.katex) return;
+    document.querySelectorAll("[data-lexical-editor='true'][contenteditable='false']").forEach(function (editor) {
+      if (editor.closest("[data-viewer-lexical-clone='1']")) return;
+      var wrapper = editor.parentElement;
+      if (!wrapper) return;
+      var signature = (editor.textContent || "") + "|" + editor.childElementCount;
+      var clone = wrapper.querySelector(":scope > [data-viewer-lexical-clone='1']");
+      if (clone && clone.getAttribute("data-viewer-source-signature") === signature) {
+        // A replacement editor can already be hidden when it is cloned.  Never
+        // let that transient source state hide the stable read-only preview.
+        clone.style.removeProperty("display");
+        editor.style.display = "none";
+        return;
+      }
+      if (clone) clone.remove();
+
+      clone = editor.cloneNode(true);
+      clone.setAttribute("data-viewer-lexical-clone", "1");
+      clone.setAttribute("data-viewer-source-signature", signature);
+      clone.removeAttribute("data-lexical-editor");
+      clone.removeAttribute("contenteditable");
+      clone.removeAttribute("aria-label");
+      clone.removeAttribute("aria-readonly");
+      clone.style.removeProperty("display");
+      clone.querySelectorAll("[id]").forEach(function (node) { node.removeAttribute("id"); });
+      clone.querySelectorAll("[data-lexical-text]").forEach(function (node) {
+        node.removeAttribute("data-lexical-text");
+        node.removeAttribute("data-viewer-tex-rendered");
+      });
+      wrapper.appendChild(clone);
+      editor.style.display = "none";
+      decodeSafeHtmlText(clone);
+      repairRenderedKatex(clone);
+      renderLexicalDisplayBlocks(clone);
+      renderTexText(clone);
+    });
+  }
+
+  function escapeHtmlText(value) {
+    return String(value || "").replace(/[&<>"]/g, function (ch) {
+      return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch];
+    });
+  }
+
+  function renderTexHtml(text) {
+    var pattern = /(\\$\\$[\\s\\S]+?\\$\\$|\\\\\\[[\\s\\S]+?\\\\\\]|\\\\\\([\\s\\S]+?\\\\\\)|\\$[^\\n$]+?\\$)/g;
+    var last = 0;
+    var changed = false;
+    var html = "";
+    var match;
+    while ((match = pattern.exec(text))) {
+      var token = match[0];
+      var display = false;
+      var tex = "";
+      if (token.indexOf("$$") === 0) {
+        display = true;
+        tex = token.slice(2, -2);
+      } else if (token.indexOf("\\\\[") === 0) {
+        display = true;
+        tex = token.slice(2, -2);
+      } else if (token.indexOf("\\\\(") === 0) {
+        tex = token.slice(2, -2);
+      } else {
+        tex = token.slice(1, -1);
+      }
+      if (!tex.trim()) continue;
+      html += escapeHtmlText(text.slice(last, match.index));
+      try {
+        html += window.katex.renderToString(normalizeTexForMarkdown(tex), { displayMode: display, throwOnError: false });
+        changed = true;
+      } catch (_) {
+        html += escapeHtmlText(token);
+      }
+      last = match.index + token.length;
+    }
+    if (!changed) return null;
+    html += escapeHtmlText(text.slice(last));
+    return html;
+  }
+
+  function renderTexLexicalSpans(root) {
+    if (!root.querySelectorAll) return;
+    root.querySelectorAll("span[data-lexical-text='true']").forEach(function (span) {
+      if (span.getAttribute("data-viewer-tex-rendered") === "1") return;
+      var text = span.textContent || "";
+      if (text.indexOf("$") === -1 && text.indexOf("\\\\(") === -1 && text.indexOf("\\\\[") === -1) return;
+      var html = renderTexHtml(text);
+      if (!html) return;
+      var holder = document.createElement("span");
+      holder.setAttribute("data-viewer-tex-holder", "1");
+      holder.style.display = "block";
+      holder.style.margin = "0.25rem 0";
+      holder.innerHTML = html;
+      var container = (span.closest && (span.closest(".mdxeditor-rich-text-editor") || span.closest(".mdxeditor"))) || span.parentNode;
+      if (container) {
+        container.appendChild(holder);
+        span.setAttribute("data-viewer-tex-rendered", "1");
+      }
+    });
+  }
+
+  function markdownCandidateRoots() {
+    var selectors = [
+      ".markdown-body",
+      "[class*='markdown']",
+      "[class*='Markdown']",
+      "[class*='preview']",
+      "[class*='Preview']",
+      "[class*='viewer']",
+      "[class*='Viewer']",
+      "article"
+    ];
+    var roots = [];
+    selectors.forEach(function (selector) {
+      document.querySelectorAll(selector).forEach(function (node) {
+        if (node && roots.indexOf(node) === -1) roots.push(node);
+      });
+    });
+    if (document.body && roots.indexOf(document.body) === -1) roots.push(document.body);
+    return roots.filter(function (node) {
+      if (!node || !node.textContent) return false;
+      if (node.closest && node.closest("script,style,textarea")) return false;
+      return /\\$|\\\\\\(|\\\\\\[|<\\/?(?:img|br|span|sub|sup|kbd|mark|small|details|summary|u|s|del|ins|center)\\b/i.test(node.textContent);
+    });
+  }
+
+  function enhanceMarkdownNow() {
+    markdownEnhanceScheduled = false;
+    ensureMarkdownEnhancerAssets().then(function () {
+      enhanceLexicalPreviews();
+      markdownCandidateRoots().forEach(function (root) {
+        try {
+          decodeSafeHtmlText(root);
+          renderTexText(root);
+          if (window.renderMathInElement) {
+            window.renderMathInElement(root, {
+              delimiters: [
+                { left: "$$", right: "$$", display: true },
+                { left: "\\\\[", right: "\\\\]", display: true },
+                { left: "\\\\(", right: "\\\\)", display: false },
+                { left: "$", right: "$", display: false }
+              ],
+              ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code", "option"],
+              throwOnError: false
+            });
+          }
+        } catch (_) {}
+      });
+    });
+  }
+
+  function scheduleMarkdownEnhance() {
+    if (markdownEnhanceScheduled) return;
+    markdownEnhanceScheduled = true;
+    window.setTimeout(enhanceMarkdownNow, 250);
+  }
+
+  function startMarkdownPatch() {
+    scheduleMarkdownEnhance();
+    var observer = new MutationObserver(scheduleMarkdownEnhance);
+    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+    var attempts = 0;
+    var timer = setInterval(function () {
+      scheduleMarkdownEnhance();
+      attempts += 1;
+      if (attempts >= 60) clearInterval(timer);
+    }, 500);
+  }
 
   function isPlainSession(url) {
     try {
@@ -201,6 +734,7 @@ VIEWER_PATCH = """<script>
       attempts += 1;
       if (attempts >= 40) clearInterval(timer);
     }, 250);
+    startMarkdownPatch();
   }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", startVisitorPatch);
@@ -226,9 +760,12 @@ HOP_BY_HOP = {
 
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "viewer-proxy/1.10"
+    server_version = "viewer-proxy/1.16"
 
     def do_GET(self):
+        if self.should_serve_asset():
+            self.serve_asset()
+            return
         if self.should_redirect_to_share():
             self.redirect_to_share()
             return
@@ -244,6 +781,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.proxy()
 
     def do_HEAD(self):
+        if self.should_serve_asset():
+            self.serve_asset()
+            return
         if self.should_redirect_to_share():
             self.redirect_to_share()
             return
@@ -306,6 +846,84 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def should_serve_service_worker(self):
         return urlsplit(self.path).path == SERVICE_WORKER_PATH
+
+    def should_serve_asset(self):
+        return urlsplit(self.path).path.startswith(ASSET_PREFIX)
+
+    def katex_head_assets(self):
+        try:
+            css = self.read_asset("katex/katex.min.css")
+            katex_js = self.read_asset("katex/katex.min.js")
+            auto_render_js = self.read_asset("katex/contrib/auto-render.min.js")
+        except OSError:
+            return KATEX_HEAD_ASSETS
+
+        css = css.replace(b"url(fonts/", b"url(/viewer-assets/katex/fonts/")
+        return b"".join([
+            b'<style data-viewer-katex="1">\n',
+            css,
+            b"\n</style>\n",
+            b'<script type="application/viewer-katex-source" id="viewer-katex-js" data-viewer-katex="1">\n',
+            self.safe_inline_script(katex_js),
+            b"\n</script>\n",
+            b'<script type="application/viewer-katex-source" id="viewer-katex-auto-render-js" data-viewer-katex="1">\n',
+            self.safe_inline_script(auto_render_js),
+            b"\n</script>\n",
+        ])
+
+    def read_asset(self, relative):
+        root = os.path.realpath(ASSET_ROOT)
+        asset_path = os.path.realpath(os.path.join(root, relative))
+        if asset_path != root and not asset_path.startswith(root + os.sep):
+            raise OSError("asset path escapes root")
+        with open(asset_path, "rb") as fh:
+            return fh.read()
+
+    def safe_inline_script(self, data):
+        return data.replace(b"</script", b"<\\/script").replace(b"</SCRIPT", b"<\\/SCRIPT")
+
+    def serve_asset(self):
+        request_path = urlsplit(self.path).path
+        relative = unquote(request_path[len(ASSET_PREFIX):])
+        relative = relative.lstrip("/")
+        relative = os.path.normpath(relative)
+        if relative in ("", ".") or relative.startswith("..") or os.path.isabs(relative):
+            self.send_error(404, "Asset not found")
+            return
+
+        root = os.path.realpath(ASSET_ROOT)
+        asset_path = os.path.realpath(os.path.join(root, relative))
+        if asset_path != root and not asset_path.startswith(root + os.sep):
+            self.send_error(404, "Asset not found")
+            return
+        if not os.path.isfile(asset_path):
+            self.send_error(404, "Asset not found")
+            return
+
+        content_type = mimetypes.guess_type(asset_path)[0] or "application/octet-stream"
+        if asset_path.endswith(".js"):
+            content_type = "application/javascript; charset=utf-8"
+        elif asset_path.endswith(".css"):
+            content_type = "text/css; charset=utf-8"
+        elif asset_path.endswith(".woff2"):
+            content_type = "font/woff2"
+        elif asset_path.endswith(".woff"):
+            content_type = "font/woff"
+        elif asset_path.endswith(".ttf"):
+            content_type = "font/ttf"
+
+        size = os.path.getsize(asset_path)
+        self.send_response(200)
+        self.send_header("X-Viewer-Proxy", self.server_version)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(asset_path, "rb") as fh:
+            shutil.copyfileobj(fh, self.wfile, length=1024 * 1024)
 
     def serve_service_worker(self):
         self.send_response(200)
@@ -516,10 +1134,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             body = resp.read(response_length)
         marker = b"</head>"
         head_marker = b"<head>"
+        injection = self.katex_head_assets() + VIEWER_PATCH
         if head_marker in body and VIEWER_PATCH not in body:
-            body = body.replace(head_marker, head_marker + VIEWER_PATCH, 1)
+            body = body.replace(head_marker, head_marker + injection, 1)
         elif marker in body and VIEWER_PATCH not in body:
-            body = body.replace(marker, VIEWER_PATCH + marker, 1)
+            body = body.replace(marker, injection + marker, 1)
         body = body.replace(b"<script async type=\"module\"", b"<script type=\"module\"")
 
         self.send_response(resp.status, resp.reason)

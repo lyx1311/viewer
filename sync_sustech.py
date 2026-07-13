@@ -120,6 +120,7 @@ class Publisher:
         self.credential_file = self.base / s["credential_file"]
         self.state_file = self.base / s["state_file"]
         self.cache_dir = self.base / s["cache_dir"]
+        self.build_dir: Path | None = None
         self.report_file = self.base / s["report_file"]
         self.log_file = self.base / s["log_file"]
         self.marker_name = s["marker_name"]
@@ -191,6 +192,30 @@ class Publisher:
     def transform_markdown(self, md_path: Path, text: str) -> tuple[str, set[Path]]:
         images: set[Path] = set()
 
+        # Cloudreve's rich-text Markdown parser collapses blank quote lines such
+        # as `> text\n>\n> next` into one continuous line. Preserve the author's
+        # intended line break without creating separate paragraphs by changing
+        # the publishing copy to Markdown hard breaks (`two spaces + newline`).
+        # The source note is never modified.
+        lines = text.splitlines(keepends=True)
+        normalized_lines: list[str] = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            if (
+                re.match(r"^[ \t]*>[ \t]*\S", line.rstrip("\r\n"))
+                and index + 2 < len(lines)
+                and re.match(r"^[ \t]*>[ \t]*$", lines[index + 1].rstrip("\r\n"))
+                and re.match(r"^[ \t]*>[ \t]*\S", lines[index + 2].rstrip("\r\n"))
+            ):
+                ending = "\r\n" if line.endswith("\r\n") else "\n"
+                normalized_lines.append(line.rstrip("\r\n ") + "  " + ending)
+                index += 2
+                continue
+            normalized_lines.append(line)
+            index += 1
+        text = "".join(normalized_lines)
+
         def handle(raw: str) -> str | None:
             if is_external(raw):
                 return raw
@@ -233,6 +258,18 @@ class Publisher:
 
         text = re.sub(r"(?is)(<img\b[^>]*?\bsrc\s*=\s*)([\"'])(.*?)(?:\2)", html_img, text)
 
+        # Cloudreve's rich-text preview parses Markdown as MDX, where HTML void
+        # elements must be explicitly self-closing. Browsers accept <img> and
+        # <br>, but MDX otherwise reports a misleading missing closing-tag error.
+        # Normalize only the generated publishing copy; never alter source notes.
+        def close_void_element(match: re.Match[str]) -> str:
+            tag = match.group(0)
+            if re.search(r"/\s*>$", tag):
+                return tag
+            return re.sub(r"\s*>$", " />", tag)
+
+        text = re.sub(r"(?is)<(?:img|br)\b[^>]*>", close_void_element, text)
+
         # Markdown image destinations. This deliberately accepts legacy unescaped spaces.
         def md_img(match: re.Match[str]) -> str:
             alt, value = match.group(1), match.group(2)
@@ -269,11 +306,10 @@ class Publisher:
             for path in sorted(p for p in temp.rglob("*") if p.is_file()):
                 rel = path.relative_to(temp).as_posix()
                 files[rel] = {"path": path, "size": path.stat().st_size, "sha256": sha256(path)}
-            if self.cache_dir.exists():
-                shutil.rmtree(self.cache_dir)
-            temp.replace(self.cache_dir)
-            for data in files.values():
-                data["path"] = self.cache_dir / Path(str(data["path"]).split(str(temp) + os.sep, 1)[-1])
+            # Keep each run's build tree private. A scheduled pythonw sync may
+            # overlap a manual invocation; sharing/replacing one cache directory
+            # makes Windows file locks turn that harmless overlap into a failure.
+            self.build_dir = temp
             self.logger.info("Built %d Markdown files and %d referenced images", md_count, len(all_images))
             return files
         except Exception:
@@ -430,7 +466,18 @@ def run_sync(pub: Publisher, dry_run: bool) -> int:
                 raise SyncError("Remote root is not empty and has no valid safety marker; refusing to sync/delete")
             dav.put(marker_rel, data=(pub.marker_value + "\n").encode())
             marker_ok = True
-        dirs = sorted({str(PurePosixPath(rel).parent) for rel in local if str(PurePosixPath(rel).parent) != "."}, key=lambda x: x.count("/"))
+        # Existing mirrored directories are already present. Rechecking every
+        # directory on every run produces hundreds of redundant MKCOL requests
+        # and can make Cloudflare close the long-lived request sequence. Only
+        # ensure parents needed by files that will actually be uploaded.
+        dirs = sorted(
+            {
+                str(PurePosixPath(rel).parent)
+                for rel in uploads
+                if str(PurePosixPath(rel).parent) != "."
+            },
+            key=lambda x: x.count("/"),
+        )
         for directory in dirs:
             dav.ensure_dir(f"{pub.remote_root}/{directory}")
         new_state: dict[str, dict[str, object]] = {}
@@ -464,6 +511,10 @@ def run_sync(pub: Publisher, dry_run: bool) -> int:
         pub.write_report(report)
         pub.logger.exception("Sync failed: %s", exc)
         return 1
+    finally:
+        if pub.build_dir is not None:
+            shutil.rmtree(pub.build_dir, ignore_errors=True)
+            pub.build_dir = None
 
 
 def status(pub: Publisher) -> int:
